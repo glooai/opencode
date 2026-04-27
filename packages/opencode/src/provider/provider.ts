@@ -684,7 +684,12 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           return { autoload: false }
         }
 
-        const GLOO_BASE_URL = process.env["GLOO_BASE_URL"] ?? "http://localhost:8000"
+        // Default to production. Local dev is opt-in via an explicit
+        // GLOO_BASE_URL=http://localhost:8000 (paired with the /gloo-local-dev
+        // skill which brings up the ai-api stack). This avoids the silent
+        // failure mode where a fresh checkout points at a port nothing is
+        // listening on.
+        const GLOO_BASE_URL = process.env["GLOO_BASE_URL"] ?? "https://platform.ai.gloo.com"
         const isLocal = GLOO_BASE_URL.includes("localhost") || GLOO_BASE_URL.includes("127.0.0.1")
 
         log.info("gloo provider init", {
@@ -1398,7 +1403,7 @@ const layer: Layer.Layer<
               family: m.family,
               api: {
                 id: m.id,
-                url: `${process.env["GLOO_BASE_URL"] ?? "http://localhost:8000"}/ai/v2`,
+                url: `${process.env["GLOO_BASE_URL"] ?? "https://platform.ai.gloo.com"}/ai/v2`,
                 npm: "@ai-sdk/openai-compatible",
               },
               status: "active",

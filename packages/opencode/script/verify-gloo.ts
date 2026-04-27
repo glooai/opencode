@@ -85,8 +85,9 @@ function checkBuildSanity() {
 function checkCreds(): { clientId: string; clientSecret: string; baseUrl: string } | null {
   const clientId = process.env.GLOO_CLIENT_ID ?? process.env.GLOO_AI_CLIENT_ID
   const clientSecret = process.env.GLOO_CLIENT_SECRET ?? process.env.GLOO_AI_CLIENT_SECRET
+  const envBaseUrl = process.env.GLOO_BASE_URL
   const baseUrl = isLocal
-    ? (process.env.GLOO_BASE_URL ?? "http://localhost:8000")
+    ? (envBaseUrl ?? "http://localhost:8000")
     : "https://platform.ai.gloo.com"
 
   if (!clientId || !clientSecret) {
@@ -94,6 +95,19 @@ function checkCreds(): { clientId: string; clientSecret: string; baseUrl: string
       name: "Creds",
       ok: false,
       detail: "GLOO_CLIENT_ID and GLOO_CLIENT_SECRET must be set (try: `set -a && source .env.local && set +a`)",
+    })
+    return null
+  }
+
+  // Catch the silent-misconfig case where .env.local points at localhost
+  // but the user did not pass --local (i.e. they think they're hitting prod).
+  // Without this guard the script would still pass — but `bun run dev` would
+  // hit ECONNREFUSED on :8000.
+  if (!isLocal && envBaseUrl && (envBaseUrl.includes("localhost") || envBaseUrl.includes("127.0.0.1"))) {
+    log({
+      name: "Creds",
+      ok: false,
+      detail: `GLOO_BASE_URL is set to ${envBaseUrl} but --local was not passed. Either pass --local (and bring up ai-api with /gloo-local-dev) or unset GLOO_BASE_URL / point it at https://platform.ai.gloo.com.`,
     })
     return null
   }
