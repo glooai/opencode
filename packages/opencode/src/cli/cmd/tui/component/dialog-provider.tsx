@@ -33,8 +33,9 @@ export function createDialogProviderOptions() {
   const { theme } = useTheme()
   const onboarded = useConnected()
   const options = createMemo(() => {
+    const connected = new Set(sync.data.provider_next.connected)
     return pipe(
-      sync.data.provider_next.all,
+      sync.data.provider_next.all.filter((p) => !connected.has(p.id)),
       sortBy((x) => PROVIDER_PRIORITY[x.id] ?? 99),
       map((provider) => {
         const consoleManaged = isConsoleManagedProvider(sync.data.console_state.consoleManagedProviders, provider.id)

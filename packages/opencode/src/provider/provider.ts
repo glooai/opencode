@@ -672,6 +672,133 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         },
       }
     }),
+    gloo: () =>
+      Effect.promise(async () => {
+        const clientId = process.env["GLOO_CLIENT_ID"] ?? process.env["GLOO_AI_CLIENT_ID"]
+        const clientSecret = process.env["GLOO_CLIENT_SECRET"] ?? process.env["GLOO_AI_CLIENT_SECRET"]
+        if (!clientId || !clientSecret) {
+          log.info("gloo provider skipped", {
+            hasClientId: !!clientId,
+            hasClientSecret: !!clientSecret,
+          })
+          return { autoload: false }
+        }
+
+        const GLOO_BASE_URL = process.env["GLOO_BASE_URL"] ?? "http://localhost:8000"
+        const isLocal = GLOO_BASE_URL.includes("localhost") || GLOO_BASE_URL.includes("127.0.0.1")
+
+        log.info("gloo provider init", {
+          clientIdPrefix: clientId.slice(0, 8) + "…",
+          envSource: process.env["GLOO_CLIENT_ID"] ? "GLOO_CLIENT_ID" : "GLOO_AI_CLIENT_ID",
+          baseURL: GLOO_BASE_URL,
+          mode: isLocal ? "local" : "prod",
+        })
+
+        const TOKEN_URL = `${GLOO_BASE_URL}/oauth2/token`
+        let tokenCache: { accessToken: string; expiresAt: number } | null = null
+        let pendingTokenRequest: Promise<string> | null = null
+
+        async function fetchToken(): Promise<string> {
+          // Local ai-api has no OAuth2 endpoint — it accepts any Bearer token
+          // in local/preview mode (ENVIRONMENT=local). Use clientId as the token.
+          if (isLocal) {
+            log.info("gloo local mode — skipping OAuth2 token exchange", {
+              clientIdPrefix: clientId!.slice(0, 8) + "…",
+            })
+            tokenCache = {
+              accessToken: clientId!,
+              expiresAt: Date.now() + 3600 * 1000,
+            }
+            return clientId!
+          }
+
+          const encodedCredentials = Buffer.from(
+            `${encodeURIComponent(clientId!)}:${encodeURIComponent(clientSecret!)}`,
+          ).toString("base64")
+
+          const response = await fetch(TOKEN_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              Authorization: `Basic ${encodedCredentials}`,
+            },
+            body: new URLSearchParams({
+              grant_type: "client_credentials",
+              scope: "api/access",
+            }),
+          })
+
+          if (!response.ok) {
+            const text = await response.text()
+            log.error("gloo token request failed", {
+              status: response.status,
+              body: text.slice(0, 200),
+              clientIdPrefix: clientId!.slice(0, 8) + "…",
+            })
+            throw new Error(`Gloo AI token request failed (${response.status}): ${text}`)
+          }
+
+          const data = (await response.json()) as { access_token: string; expires_in?: number }
+          const expiresIn = data.expires_in ?? 3600
+
+          tokenCache = {
+            accessToken: data.access_token,
+            expiresAt: Date.now() + (expiresIn - 60) * 1000,
+          }
+
+          log.info("gloo token acquired", {
+            expiresIn,
+            tokenPrefix: data.access_token.slice(0, 12) + "…",
+          })
+
+          return data.access_token
+        }
+
+        async function getValidToken(): Promise<string> {
+          if (tokenCache && Date.now() < tokenCache.expiresAt) {
+            const remainingSec = Math.round((tokenCache.expiresAt - Date.now()) / 1000)
+            log.info("gloo token cache hit", {
+              remainingSec,
+              tokenPrefix: tokenCache.accessToken.slice(0, 12) + "…",
+            })
+            return tokenCache.accessToken
+          }
+
+          if (!pendingTokenRequest) {
+            pendingTokenRequest = fetchToken().finally(() => {
+              pendingTokenRequest = null
+            })
+          }
+
+          return pendingTokenRequest
+        }
+
+        return {
+          autoload: true,
+          options: {
+            baseURL: `${GLOO_BASE_URL}/ai/v2`,
+            fetch: async (url: RequestInfo | URL, init?: RequestInit) => {
+              const token = await getValidToken()
+              const headers = new Headers(init?.headers)
+              headers.set("Authorization", `Bearer ${token}`)
+              log.info("gloo fetch", {
+                url: String(url),
+                tokenPrefix: token.slice(0, 12) + "…",
+              })
+              const res = await fetch(url, { ...init, headers })
+              if (!res.ok) {
+                const body = await res.clone().text().catch(() => "")
+                log.warn("gloo fetch failed", {
+                  status: res.status,
+                  statusText: res.statusText,
+                  body: body.slice(0, 300),
+                })
+              }
+              return res
+            },
+          },
+        }
+      }),
     "cloudflare-workers-ai": Effect.fnUntraced(function* (input: Info) {
       // When baseURL is already configured (e.g. corporate config routing through a proxy/gateway),
       // skip the account ID check because the URL is already fully specified.
@@ -1213,6 +1340,94 @@ const layer: Layer.Layer<
             parsed.models[modelID] = parsedModel
           }
           database[providerID] = parsed
+        }
+
+        // Seed Gloo AI provider (not in models.dev). Must run before the
+        // env-loading loop below so credential detection sees the entry.
+        // toolcall defaults to true; set false for models the platform rejects
+        // with HTTP 400 "does not support function calling" or that drop the
+        // stream when tools are present (verified 2026-04-27 against
+        // platform.ai.gloo.com via test/provider/gloo-models.test.ts).
+        if (!database["gloo"]) {
+          const glooModelDefs: Array<{
+            id: string
+            name: string
+            family: string
+            context: number
+            output: number
+            reasoning: boolean
+            image: boolean
+            toolcall?: boolean
+          }> = [
+            // Anthropic
+            { id: "gloo-anthropic-claude-haiku-4.5", name: "Claude Haiku 4.5", family: "claude", context: 200000, output: 8192, reasoning: false, image: true },
+            { id: "gloo-anthropic-claude-sonnet-4", name: "Claude Sonnet 4", family: "claude", context: 200000, output: 16384, reasoning: true, image: true },
+            { id: "gloo-anthropic-claude-sonnet-4.5", name: "Claude Sonnet 4.5", family: "claude", context: 200000, output: 16384, reasoning: true, image: true },
+            { id: "gloo-anthropic-claude-sonnet-4.6", name: "Claude Sonnet 4.6", family: "claude", context: 200000, output: 16384, reasoning: true, image: true },
+            { id: "gloo-anthropic-claude-opus-4.5", name: "Claude Opus 4.5", family: "claude", context: 200000, output: 32768, reasoning: true, image: true },
+            { id: "gloo-anthropic-claude-opus-4.6", name: "Claude Opus 4.6", family: "claude", context: 200000, output: 32768, reasoning: true, image: true },
+            // Google
+            { id: "gloo-google-gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite", family: "gemini", context: 1000000, output: 8192, reasoning: false, image: true },
+            { id: "gloo-google-gemini-2.5-flash", name: "Gemini 2.5 Flash", family: "gemini", context: 1000000, output: 8192, reasoning: true, image: true },
+            { id: "gloo-google-gemini-2.5-pro", name: "Gemini 2.5 Pro", family: "gemini", context: 1000000, output: 16384, reasoning: true, image: true },
+            // gloo-google-gemini-3-pro-preview removed 2026-04-27: no longer
+            // in Gloo catalog (`/ai/v2/models` returns "model not supported").
+            // OpenAI
+            { id: "gloo-openai-gpt-5-nano", name: "GPT-5 Nano", family: "gpt", context: 128000, output: 16384, reasoning: false, image: true },
+            { id: "gloo-openai-gpt-5-mini", name: "GPT-5 Mini", family: "gpt", context: 128000, output: 16384, reasoning: true, image: true },
+            { id: "gloo-openai-gpt-4.1-mini", name: "GPT-4.1 Mini", family: "gpt", context: 1000000, output: 32768, reasoning: false, image: true },
+            { id: "gloo-openai-gpt-4.1", name: "GPT-4.1", family: "gpt", context: 1000000, output: 32768, reasoning: false, image: true },
+            { id: "gloo-openai-gpt-5.2", name: "GPT-5.2", family: "gpt", context: 128000, output: 32768, reasoning: true, image: true },
+            { id: "gloo-openai-gpt-5.4", name: "GPT-5.4", family: "gpt", context: 128000, output: 32768, reasoning: true, image: true },
+            { id: "gloo-openai-gpt-5.2-pro", name: "GPT-5.2 Pro", family: "gpt", context: 128000, output: 32768, reasoning: true, image: true },
+            // Open Source — toolcall:false applied where the platform rejects tools
+            { id: "gloo-meta-llama-3.1-8b-instruct", name: "Llama 3.1 8B Instruct", family: "llama", context: 128000, output: 8192, reasoning: false, image: false, toolcall: false },
+            { id: "gloo-meta-llama-4-maverick", name: "Meta Llama 4 Maverick", family: "llama", context: 128000, output: 16384, reasoning: true, image: true, toolcall: false },
+            { id: "gloo-deepseek-chat-v3.1", name: "DeepSeek Chat V3.1", family: "deepseek", context: 128000, output: 8192, reasoning: false, image: false },
+            { id: "gloo-deepseek-v3.2", name: "DeepSeek V3.2", family: "deepseek", context: 128000, output: 8192, reasoning: true, image: false },
+            { id: "gloo-deepseek-r1", name: "DeepSeek R1", family: "deepseek", context: 128000, output: 8192, reasoning: true, image: false, toolcall: false },
+            { id: "gloo-openai-gpt-oss-120b", name: "GPT OSS 120B", family: "gpt-oss", context: 128000, output: 16384, reasoning: true, image: false },
+          ]
+
+          const glooModels: Record<string, Model> = {}
+          for (const m of glooModelDefs) {
+            glooModels[m.id] = {
+              id: ModelID.make(m.id),
+              providerID: ProviderID.make("gloo"),
+              name: m.name,
+              family: m.family,
+              api: {
+                id: m.id,
+                url: `${process.env["GLOO_BASE_URL"] ?? "http://localhost:8000"}/ai/v2`,
+                npm: "@ai-sdk/openai-compatible",
+              },
+              status: "active",
+              headers: {},
+              options: {},
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: m.context, output: m.output },
+              capabilities: {
+                temperature: true,
+                reasoning: m.reasoning,
+                attachment: m.image,
+                toolcall: m.toolcall ?? true,
+                input: { text: true, audio: false, image: m.image, video: false, pdf: false },
+                output: { text: true, audio: false, image: false, video: false, pdf: false },
+                interleaved: false,
+              },
+              release_date: "",
+              variants: {},
+            }
+          }
+
+          database["gloo"] = {
+            id: ProviderID.make("gloo"),
+            name: "Gloo AI",
+            source: "custom",
+            env: ["GLOO_CLIENT_ID", "GLOO_AI_CLIENT_ID"],
+            options: {},
+            models: glooModels,
+          }
         }
 
         // load env
