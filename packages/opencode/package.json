@@ -15,6 +15,7 @@
     "upgrade-opentui": "bun run script/upgrade-opentui.ts",
     "dev": "bun run --conditions=browser ./src/index.ts",
     "dev:temporary": "bun run --conditions=browser ./src/temporary.ts",
+    "verify:gloo": "bun run script/verify-gloo.ts",
     "db": "bun drizzle-kit"
   },
   "bin": {
