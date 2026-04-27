@@ -1,54 +1,69 @@
 #!/usr/bin/env bash
 #
-# install.sh — Bootstrap a `gloocode` shell shortcut from a local clone of
-# glooai/opencode. Works regardless of where you cloned the repo.
+# install.sh — Bootstrap a `gloocode` launcher from a local clone of
+# glooai/opencode. Works regardless of where you cloned the repo and
+# regardless of which shell you use.
 #
-# What it does:
-#   1. Preflight: verifies bun is on PATH (warns if version < 1.3.13, which
-#      the pre-push hook requires; soft warning, not fatal). Runs `bun install`
-#      if `node_modules` is absent (skip with --skip-install).
+# Architecture:
+#
+#   ${XDG_DATA_HOME:-~/.local/share}/gloocode  →  /your/clone/path     (symlink: stable handle for the repo)
+#   ${XDG_CONFIG_HOME:-~/.config}/gloocode/credentials                 (mode 0600, sourceable shell file: GLOO_*)
+#   ${BIN_DIR:-~/.local/bin}/gloocode                                  (mode 0755 executable shim — the canonical launcher)
+#
+#   Shell rc (~/.zshrc, ~/.bashrc, ~/.config/fish/conf.d/gloocode.fish)
+#     — managed PATH-only block that ensures the shim's bin dir is on PATH.
+#     — no shell function. The shim is a real executable; any shell can run it.
+#
+# What it does on a full install:
+#
+#   1. Preflight: verifies bun is on PATH (warns if version < 1.3.13). Runs
+#      `bun install` if `node_modules` is absent (skip with --skip-install).
+#
 #   2. Stable handle: symlinks `${XDG_DATA_HOME:-~/.local/share}/gloocode`
-#      to this clone, so the rc function references a path that is stable
-#      across machines and re-clones. Move the repo? Re-run install.sh to
-#      update the symlink. Disable with --no-canonical (writes the raw clone
-#      path into the rc instead).
-#   3. Auth (interactive): if no Gloo credentials are saved, opens
-#      https://studio.ai.gloo.com/api-credentials in your browser, prompts
-#      you to paste the client ID and client secret separately (both hidden,
-#      no shell-history leak), validates them with a live OAuth2
-#      client_credentials grant, then persists them to a 0600-mode file at
-#      `${XDG_CONFIG_HOME:-~/.config}/gloocode/credentials` with a refresh
-#      timestamp. The credential file is sourceable shell so the gloocode
-#      function loads it with `source` — no JSON parser dependency. A TTL
-#      (default 90 days) drives a soft hygiene warning, not an enforcement;
-#      Gloo platform credentials are long-lived API keys.
-#   4. Shell integration: appends (or, idempotently, replaces) a managed
-#      function block in your shell rc. The function:
-#        - keeps your current cwd as the workspace (does NOT cd into this repo)
-#        - sources the saved credentials file via absolute path
-#        - sources `<canonical>/.env.local` (if present) for repo-local overrides
-#          (e.g., GLOO_BASE_URL=http://localhost:8000 when paired with /gloo-local-dev)
-#        - warns if credentials are older than the configured TTL
-#        - launches `bun run --conditions=browser <canonical>/packages/opencode/src/index.ts "$@"`
-#      so opencode treats *your project* as the workspace while still finding
-#      the Gloo AI provider seed and OAuth creds.
+#      to this clone, so the shim references a path that is stable across
+#      machines and re-clones. Move the repo? Re-run install.sh from the new
+#      location to update the symlink.
 #
-# Idempotent: re-running this script replaces the managed block; it doesn't
-# touch any unmanaged definitions you may have written by hand.
+#   3. Auth (interactive): if no credentials are saved, opens
+#      https://studio.ai.gloo.com/api-credentials in your browser, prompts
+#      you to paste the client ID and secret separately (both hidden, no
+#      shell-history leak). Validates them with a live OAuth2
+#      client_credentials grant — the auth header is built the same way the
+#      runtime provider builds it (encodeURIComponent on each field, then
+#      base64), so credentials with reserved characters like `:` or `+` are
+#      handled correctly. Persists to a 0600-mode file.
+#
+#   4. Shim install: writes an executable `gloocode` script at the bin dir.
+#      The shim sources the credentials file as canonical, refuses to run
+#      against `http://localhost*` unless `GLOOCODE_LOCAL=1` is set (matches
+#      the verify-gloo.ts guard), and only sources `<repo>/.env.local` when
+#      `GLOOCODE_LOCAL=1` is set — so a stale repo-local override cannot
+#      silently break production launches.
+#
+#   5. Shell integration (PATH-only): ensures the bin dir is on PATH in your
+#      shell rc. Per-shell rendering for zsh/bash/fish; unsupported shells
+#      fail fast with manual instructions instead of silently writing to a
+#      file you don't actually load.
+#
+# Idempotent at every layer. Re-running this script:
+#   - replaces the managed rc block in place (no duplicates)
+#   - rewrites the shim atomically (mktemp + chmod + rename)
+#   - updates the canonical symlink target to point at the current clone
 #
 # Usage:
-#   ./install.sh                           # full install: preflight → symlink → auth (if needed) → rc
+#   ./install.sh                           # full install
 #   ./install.sh --auth                    # only run the credential prompt; rotate creds
-#   ./install.sh --skip-auth               # full install but skip the auth flow even if creds missing
-#   ./install.sh --auth-ttl-days N         # hygiene warning TTL in days (default 90)
-#   ./install.sh --name oc                 # name the function "oc" instead of "gloocode"
-#   ./install.sh --rc ~/.zprofile          # write into a non-default rc file
-#   ./install.sh --canonical-path /path    # custom symlink location
+#   ./install.sh --skip-auth               # full install but skip auth even if creds missing
+#   ./install.sh --auth-ttl-days N         # hygiene warning TTL (default 90)
+#   ./install.sh --name oc                 # use a different launcher name
+#   ./install.sh --bin-dir /usr/local/bin  # custom shim location (default: ~/.local/bin)
+#   ./install.sh --rc <path>               # explicit rc file (default: detect from $SHELL)
+#   ./install.sh --canonical-path <path>   # custom symlink location
 #   ./install.sh --no-canonical            # skip symlink, hard-code clone path
 #   ./install.sh --skip-install            # don't run `bun install`
-#   ./install.sh --print                   # print the function block to stdout; no rc write
-#   ./install.sh --uninstall               # remove the managed block + symlink (keeps creds file)
-#   ./install.sh --uninstall-creds         # remove the credentials file too
+#   ./install.sh --print                   # print the shim + rc block to stdout; no writes
+#   ./install.sh --uninstall               # remove shim, rc block, symlink (keeps creds)
+#   ./install.sh --uninstall-creds         # also remove the credentials file
 #   ./install.sh --help
 
 set -euo pipefail
@@ -64,6 +79,7 @@ UNINSTALL=0
 UNINSTALL_CREDS=0
 USE_CANONICAL=1
 CANONICAL_DIR_OVERRIDE=""
+BIN_DIR_OVERRIDE=""
 AUTH_ONLY=0
 SKIP_AUTH=0
 AUTH_TTL_DAYS=90
@@ -71,7 +87,7 @@ GLOO_AUTH_URL="https://studio.ai.gloo.com/api-credentials"
 GLOO_DEFAULT_BASE_URL="https://platform.ai.gloo.com"
 
 usage() {
-  sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,79p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -80,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --rc)              RC_FILE="${2:?missing value for --rc}"; shift 2 ;;
     --canonical-path)  CANONICAL_DIR_OVERRIDE="${2:?missing value for --canonical-path}"; USE_CANONICAL=1; shift 2 ;;
     --no-canonical)    USE_CANONICAL=0; shift ;;
+    --bin-dir)         BIN_DIR_OVERRIDE="${2:?missing value for --bin-dir}"; shift 2 ;;
     --print)           PRINT_ONLY=1; shift ;;
     --skip-install)    SKIP_INSTALL=1; shift ;;
     --auth)            AUTH_ONLY=1; shift ;;
@@ -92,108 +109,204 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---- Resolve canonical path --------------------------------------------
+# ---- Resolve paths ------------------------------------------------------
 
 DEFAULT_CANONICAL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/${NAME}"
-if [[ -n "$CANONICAL_DIR_OVERRIDE" ]]; then
-  CANONICAL_DIR="$CANONICAL_DIR_OVERRIDE"
-else
-  CANONICAL_DIR="$DEFAULT_CANONICAL_DIR"
-fi
+CANONICAL_DIR="${CANONICAL_DIR_OVERRIDE:-$DEFAULT_CANONICAL_DIR}"
 
 if [[ "$USE_CANONICAL" -eq 1 ]]; then
-  FUNCTION_PATH="$CANONICAL_DIR"
+  HANDLE_PATH="$CANONICAL_DIR"
 else
-  FUNCTION_PATH="$REPO_ROOT"
+  HANDLE_PATH="$REPO_ROOT"
 fi
-
-# ---- Resolve credentials path ------------------------------------------
 
 CREDS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/${NAME}"
 CREDS_FILE="$CREDS_DIR/credentials"
 
-# ---- Detect rc file -----------------------------------------------------
+BIN_DIR="${BIN_DIR_OVERRIDE:-$HOME/.local/bin}"
+SHIM_FILE="$BIN_DIR/${NAME}"
 
-if [[ -z "$RC_FILE" ]]; then
-  case "$(basename "${SHELL:-bash}")" in
-    zsh)
-      RC_FILE="$HOME/.zshrc"
-      ;;
-    bash)
-      # On macOS, Terminal launches login shells, which read .bash_profile and
-      # not .bashrc. Prefer the file that exists; default to .bashrc otherwise.
+# ---- Detect shell + rc strategy -----------------------------------------
+# SHELL_KIND: zsh | bash | fish | unknown
+# RC_FILE:    (for zsh/bash) the rc file to mutate
+#             (for fish)     the conf.d snippet path
+#             (for unknown)  empty; rc step will fail fast
+
+SHELL_KIND="unknown"
+case "$(basename "${SHELL:-}")" in
+  zsh)
+    SHELL_KIND="zsh"
+    [[ -z "$RC_FILE" ]] && RC_FILE="$HOME/.zshrc"
+    ;;
+  bash)
+    SHELL_KIND="bash"
+    if [[ -z "$RC_FILE" ]]; then
+      # macOS Terminal launches login shells; bash reads .bash_profile then.
       if [[ -f "$HOME/.bash_profile" && ! -f "$HOME/.bashrc" ]]; then
         RC_FILE="$HOME/.bash_profile"
       else
         RC_FILE="$HOME/.bashrc"
       fi
-      ;;
-    *)
-      RC_FILE="$HOME/.zshrc"
-      ;;
-  esac
-fi
+    fi
+    ;;
+  fish)
+    SHELL_KIND="fish"
+    [[ -z "$RC_FILE" ]] && RC_FILE="$HOME/.config/fish/conf.d/${NAME}.fish"
+    ;;
+  *)
+    SHELL_KIND="unknown"
+    ;;
+esac
 
 MARKER_BEGIN="# >>> ${NAME} (managed by glooai/opencode install.sh) >>>"
 MARKER_END="# <<< ${NAME} <<<"
 
-# ---- Compose the managed block -----------------------------------------
-# `${NAME}`, `${FUNCTION_PATH}`, and `${CREDS_FILE}` expand at install time.
-# `\$HOME`, `\$@`, `\$_gloocode_*`, and other shell vars stay literal so they
-# evaluate when the function is called.
+# ---- Compose the rc block (PATH-only) ----------------------------------
+# Per shell. Always idempotent.
 
-read -r -d '' BLOCK <<EOF || true
+render_rc_block() {
+  local kind="$1" bin="$2"
+  case "$kind" in
+    zsh|bash)
+      cat <<EOF
 $MARKER_BEGIN
-# Launch the OpenCode TUI from your current cwd with the Gloo AI provider
-# available. Stays in your invocation directory (so opencode treats that as
-# the workspace) while sourcing creds from the user-level credentials store
-# and the dev entry from a stable handle pointing at: $FUNCTION_PATH
-${NAME}() {
-  local _gloocode_repo="$FUNCTION_PATH"
-  local _gloocode_creds="$CREDS_FILE"
-  if [ ! -d "\$_gloocode_repo" ]; then
-    echo "error: \$_gloocode_repo missing — re-run \$_gloocode_repo/install.sh from your clone" >&2
-    return 1
-  fi
-  if [ ! -f "\$_gloocode_creds" ]; then
-    echo "error: no Gloo credentials saved. Run: \$_gloocode_repo/install.sh --auth" >&2
-    return 1
-  fi
-  (
-    export PATH="\$HOME/.bun/bin:\$PATH"
-
-    # Load saved credentials (canonical source — user-level, not per-clone).
-    set -a; source "\$_gloocode_creds"; set +a
-
-    # Soft TTL hygiene check. Gloo client_credentials don't expire on the
-    # platform; this is a reminder to rotate periodically.
-    if [ -n "\${GLOOCODE_CREDS_REFRESHED_EPOCH:-}" ] \\
-       && [ -n "\${GLOOCODE_CREDS_TTL_DAYS:-}" ] \\
-       && [ -z "\${GLOOCODE_SKIP_TTL_WARNING:-}" ]; then
-      local _now_epoch _age_days
-      _now_epoch=\$(date +%s)
-      _age_days=\$(( (_now_epoch - GLOOCODE_CREDS_REFRESHED_EPOCH) / 86400 ))
-      if [ "\$_age_days" -gt "\$GLOOCODE_CREDS_TTL_DAYS" ]; then
-        echo "warning: Gloo credentials are \$_age_days days old (TTL: \$GLOOCODE_CREDS_TTL_DAYS). Rotate with: \$_gloocode_repo/install.sh --auth" >&2
-      fi
-    fi
-
-    # Optional repo-local overrides (e.g., GLOO_BASE_URL=http://localhost:8000
-    # when developing against a local ai-api stack).
-    if [ -f "\$_gloocode_repo/.env.local" ]; then
-      set -a; source "\$_gloocode_repo/.env.local"; set +a
-    fi
-
-    bun run --conditions=browser "\$_gloocode_repo/packages/opencode/src/index.ts" "\$@"
-  )
-}
+# Ensure the ${NAME} shim is on PATH.
+case ":\$PATH:" in
+  *":${bin}:"*) ;;
+  *) export PATH="${bin}:\$PATH" ;;
+esac
 $MARKER_END
 EOF
+      ;;
+    fish)
+      cat <<EOF
+$MARKER_BEGIN
+# Ensure the ${NAME} shim is on PATH.
+fish_add_path -p -g ${bin}
+$MARKER_END
+EOF
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---- Compose the shim ---------------------------------------------------
+# `${HANDLE_PATH}` and `${CREDS_FILE}` and `${REPO_ROOT}` expand at install time.
+# Other `\$...` references stay literal — they evaluate when the shim runs.
+
+render_shim() {
+  cat <<EOF
+#!/usr/bin/env bash
+#
+# ${NAME} — auto-generated by glooai/opencode install.sh.
+# Do not edit by hand; this file is rewritten on every \`install.sh\` run.
+# To regenerate: $REPO_ROOT/install.sh
+# To rotate creds: $REPO_ROOT/install.sh --auth
+
+set -eu
+
+GLOOCODE_REPO="\${GLOOCODE_REPO_OVERRIDE:-${HANDLE_PATH}}"
+GLOOCODE_CREDS="\${GLOOCODE_CREDS_OVERRIDE:-${CREDS_FILE}}"
+GLOOCODE_REINSTALL_HINT="${REPO_ROOT}/install.sh"
+
+if [ ! -d "\$GLOOCODE_REPO" ]; then
+  echo "error: \$GLOOCODE_REPO missing — re-run \$GLOOCODE_REINSTALL_HINT from your clone" >&2
+  exit 1
+fi
+if [ ! -f "\$GLOOCODE_CREDS" ]; then
+  echo "error: no Gloo credentials saved. Run: \$GLOOCODE_REINSTALL_HINT --auth" >&2
+  exit 1
+fi
+
+# Bun (the canonical install location) — best-effort PATH augmentation.
+case ":\$PATH:" in
+  *":\$HOME/.bun/bin:"*) ;;
+  *) export PATH="\$HOME/.bun/bin:\$PATH" ;;
+esac
+
+# Source credentials FIRST as the canonical source of GLOO_*.
+# (.env.local is handled below, only when GLOOCODE_LOCAL=1.)
+set -a
+# shellcheck disable=SC1090
+. "\$GLOOCODE_CREDS"
+set +a
+
+# Soft TTL hygiene check. Gloo client_credentials don't expire on the
+# platform; this is a reminder to rotate periodically. Suppress with
+# GLOOCODE_SKIP_TTL_WARNING=1.
+if [ -n "\${GLOOCODE_CREDS_REFRESHED_EPOCH:-}" ] \\
+   && [ -n "\${GLOOCODE_CREDS_TTL_DAYS:-}" ] \\
+   && [ -z "\${GLOOCODE_SKIP_TTL_WARNING:-}" ]; then
+  age_days=\$(( (\$(date +%s) - GLOOCODE_CREDS_REFRESHED_EPOCH) / 86400 ))
+  if [ "\$age_days" -gt "\$GLOOCODE_CREDS_TTL_DAYS" ]; then
+    printf 'warning: Gloo credentials are %s days old (TTL: %s). Rotate with: %s --auth\\n' \\
+      "\$age_days" "\$GLOOCODE_CREDS_TTL_DAYS" "\$GLOOCODE_REINSTALL_HINT" >&2
+  fi
+fi
+
+# Local-dev opt-in. .env.local is only sourced when GLOOCODE_LOCAL=1, so a
+# stale repo-local override cannot silently send production launches at
+# localhost. (This mirrors the verify-gloo.ts --local guard.)
+if [ "\${GLOOCODE_LOCAL:-0}" = "1" ]; then
+  if [ -f "\$GLOOCODE_REPO/.env.local" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "\$GLOOCODE_REPO/.env.local"
+    set +a
+  fi
+fi
+
+# Validate GLOO_BASE_URL — refuse localhost without explicit opt-in.
+case "\${GLOO_BASE_URL:-}" in
+  https://*) ;;
+  http://localhost*|http://127.0.0.1*|http://0.0.0.0*)
+    if [ "\${GLOOCODE_LOCAL:-0}" != "1" ]; then
+      printf 'error: GLOO_BASE_URL=%s but GLOOCODE_LOCAL=1 not set.\\n' "\$GLOO_BASE_URL" >&2
+      printf '  For local-dev mode against ai-api: GLOOCODE_LOCAL=1 %s\\n' "${NAME}" >&2
+      printf '  To restore prod default in your creds: %s --auth\\n' "\$GLOOCODE_REINSTALL_HINT" >&2
+      exit 1
+    fi
+    ;;
+  '')
+    echo "error: GLOO_BASE_URL is empty. Re-run: \$GLOOCODE_REINSTALL_HINT --auth" >&2
+    exit 1
+    ;;
+  *)
+    printf 'error: invalid GLOO_BASE_URL=%s (expected https:// or http://localhost)\\n' "\$GLOO_BASE_URL" >&2
+    exit 1
+    ;;
+esac
+
+# Launch via the gloocode-launch wrapper:
+#   - bun runs from packages/opencode so it finds tsconfig.json (JSX +
+#     @opentui/solid jsxImportSource);
+#   - the wrapper then chdir's to the original invocation cwd so opencode's
+#     process.cwd() at runtime is the user's project, not opencode source.
+ORIG_CWD="\$(pwd)"
+exec env GLOOCODE_ORIG_CWD="\$ORIG_CWD" \\
+  bun run \\
+    --cwd "\$GLOOCODE_REPO/packages/opencode" \\
+    --conditions=browser \\
+    ./script/gloocode-launch.ts \\
+    "\$@"
+EOF
+}
 
 # ---- --print short-circuit ---------------------------------------------
 
 if [[ "$PRINT_ONLY" -eq 1 ]]; then
-  printf '%s\n' "$BLOCK"
+  echo "==== shim ($SHIM_FILE) ===="
+  render_shim
+  echo
+  echo "==== rc block ($SHELL_KIND → $RC_FILE) ===="
+  if [[ "$SHELL_KIND" == "unknown" ]]; then
+    echo "(no managed rc block — your shell is not auto-supported; add this directory to PATH manually:)"
+    echo "  $BIN_DIR"
+  else
+    render_rc_block "$SHELL_KIND" "$BIN_DIR"
+  fi
   exit 0
 fi
 
@@ -225,6 +338,16 @@ remove_canonical_symlink() {
   fi
 }
 
+remove_shim() {
+  if [[ -f "$SHIM_FILE" ]] && head -1 "$SHIM_FILE" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
+     && grep -q "^# ${NAME} — auto-generated by glooai/opencode install.sh" "$SHIM_FILE" 2>/dev/null; then
+    rm "$SHIM_FILE"
+    echo "  ✓ removed shim $SHIM_FILE"
+  elif [[ -e "$SHIM_FILE" ]]; then
+    echo "  ! $SHIM_FILE exists but is not a managed gloocode shim — leaving it untouched" >&2
+  fi
+}
+
 open_url() {
   local url="$1"
   if command -v open >/dev/null 2>&1; then
@@ -237,8 +360,6 @@ open_url() {
 }
 
 prompt_secret() {
-  # Read a secret with no echo. Trailing newline emitted manually so the
-  # prompt looks normal in a terminal.
   local prompt="$1" __dst_var="$2" __input
   if [ ! -t 0 ]; then
     echo "error: no TTY; cannot prompt for credentials interactively." >&2
@@ -252,8 +373,6 @@ prompt_secret() {
 }
 
 mask_secret() {
-  # Echo a secret with everything but the first 4 chars masked. For status
-  # messages only — never log the raw value.
   local s="$1"
   local len=${#s}
   if [ "$len" -le 4 ]; then
@@ -263,34 +382,77 @@ mask_secret() {
   fi
 }
 
+percent_encode() {
+  # Matches JS encodeURIComponent: percent-encodes everything except
+  # A-Z a-z 0-9 - _ . ~ ! * ' ( ).  Provider.ts and verify-gloo.ts both use
+  # encodeURIComponent on client_id and client_secret before base64ing for
+  # the OAuth Basic header — install.sh now matches.
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c '
+import sys, urllib.parse
+sys.stdout.write(urllib.parse.quote(sys.stdin.read(), safe="!*\x27()"))
+'
+  else
+    # Bash fallback. Sufficient for ASCII OAuth client_ids/secrets, which is
+    # what Gloo issues.
+    local s="$1" out=""
+    local i c
+    for ((i=0; i<${#s}; i++)); do
+      c="${s:$i:1}"
+      case "$c" in
+        [a-zA-Z0-9._~!*\(\)\'-]) out+="$c" ;;
+        *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+      esac
+    done
+    printf '%s' "$out"
+  fi
+}
+
+basic_auth_header() {
+  # Build the OAuth2 Basic auth header explicitly the same way the runtime
+  # provider does: percent-encode each field with encodeURIComponent
+  # semantics, concatenate with `:`, base64 the bytes, prefix with "Basic ".
+  local cid="$1" csec="$2"
+  local cid_enc csec_enc encoded
+  cid_enc=$(percent_encode "$cid")
+  csec_enc=$(percent_encode "$csec")
+  encoded=$(printf '%s:%s' "$cid_enc" "$csec_enc" | base64 | tr -d '\n')
+  printf 'Basic %s' "$encoded"
+}
+
 validate_creds() {
-  # Live OAuth2 client_credentials grant. Returns 0 on success; prints a
-  # one-line diagnostic on failure.
+  # Live OAuth2 client_credentials grant, using the same auth-header
+  # construction as the runtime provider so credentials with reserved
+  # characters round-trip correctly.
   local cid="$1" csec="$2" base="${3:-$GLOO_DEFAULT_BASE_URL}"
-  local resp body status
+  local resp body status auth
   if ! command -v curl >/dev/null 2>&1; then
     echo "  ! curl not found; skipping credential validation. Save anyway? (Y/n)" >&2
     local ans; read -r ans
     [[ "$ans" =~ ^[Nn] ]] && return 1
     return 0
   fi
-  resp=$(curl -sS -X POST -u "${cid}:${csec}" \
-    -d "grant_type=client_credentials" \
+  auth=$(basic_auth_header "$cid" "$csec")
+  resp=$(curl -sS -X POST \
+    -H "Authorization: $auth" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "scope=api/access" \
     -w '\n__HTTP_STATUS__:%{http_code}' \
     "${base%/}/oauth2/token" 2>&1) || true
   status=$(printf '%s' "$resp" | sed -n 's/^__HTTP_STATUS__://p' | tail -1)
   body=$(printf '%s' "$resp" | sed '/^__HTTP_STATUS__:/d')
   case "$status" in
     200)
-      # Be tolerant about jq being absent; just look for access_token in body.
       if printf '%s' "$body" | grep -q '"access_token"'; then
         return 0
       fi
       echo "  ! 200 OK but no access_token in response body" >&2
       return 1
       ;;
-    401|403)
-      echo "  ! credentials rejected (HTTP $status). Double-check ID/secret." >&2
+    400|401|403)
+      echo "  ! credentials rejected (HTTP $status)." >&2
+      [ -n "$body" ] && printf '    %s\n' "$body" | head -3 >&2
       return 1
       ;;
     *)
@@ -310,14 +472,12 @@ write_creds_file() {
   mkdir -p "$CREDS_DIR"
   chmod 700 "$CREDS_DIR" 2>/dev/null || true
 
-  # Write atomically: temp file, chmod, then rename. The shell-quote helper
-  # below handles single-quote escaping for sourceable output.
   local tmp
   tmp="$(mktemp "${CREDS_FILE}.XXXXXX")"
   chmod 600 "$tmp"
 
   cat > "$tmp" <<CREDS_EOF
-# Gloo AI credentials for the gloocode shell shortcut.
+# Gloo AI credentials for the ${NAME} launcher.
 # Generated by ${REPO_ROOT}/install.sh — do not edit by hand.
 # To rotate: ${REPO_ROOT}/install.sh --auth
 GLOO_CLIENT_ID=$(printf '%q' "$cid")
@@ -372,7 +532,6 @@ run_auth_flow() {
 
 creds_present() {
   [[ -f "$CREDS_FILE" ]] || return 1
-  # Cheap, no-source check: just look for the env-var lines.
   grep -q '^GLOO_CLIENT_ID='     "$CREDS_FILE" || return 1
   grep -q '^GLOO_CLIENT_SECRET=' "$CREDS_FILE" || return 1
   return 0
@@ -382,12 +541,13 @@ creds_present() {
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   echo "→ Uninstall"
-  if [[ -f "$RC_FILE" ]] && grep -qF "$MARKER_BEGIN" "$RC_FILE"; then
+  if [[ -n "$RC_FILE" && -f "$RC_FILE" ]] && grep -qF "$MARKER_BEGIN" "$RC_FILE"; then
     strip_managed_block "$RC_FILE"
     echo "  ✓ removed ${NAME} block from $RC_FILE"
   else
-    echo "  · no managed ${NAME} block in $RC_FILE"
+    echo "  · no managed ${NAME} block in ${RC_FILE:-(no rc file detected)}"
   fi
+  remove_shim
   remove_canonical_symlink "$CANONICAL_DIR"
   if [[ "$UNINSTALL_CREDS" -eq 1 ]]; then
     if [[ -f "$CREDS_FILE" ]]; then
@@ -403,7 +563,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     fi
   fi
   echo
-  echo "Done. Open a new shell to drop the function from your environment."
+  echo "Done. Open a new shell to drop ${BIN_DIR} from PATH."
   exit 0
 fi
 
@@ -432,7 +592,7 @@ if command -v bun >/dev/null 2>&1; then
   fi
 else
   echo "  ! bun not found on PATH. Install with: curl -fsSL https://bun.com/install | bash" >&2
-  echo "    The ${NAME} function adds \$HOME/.bun/bin to PATH automatically once bun is installed."
+  echo "    The shim adds \$HOME/.bun/bin to PATH automatically once bun is installed."
 fi
 
 if [[ "$SKIP_INSTALL" -eq 0 ]]; then
@@ -456,7 +616,7 @@ if [[ "$USE_CANONICAL" -eq 1 ]]; then
 
   if [[ -e "$CANONICAL_DIR" && ! -L "$CANONICAL_DIR" ]]; then
     echo "  ! $CANONICAL_DIR exists and is not a symlink — refusing to overwrite." >&2
-    echo "    Either move it aside or pass --canonical-path with a different location, or use --no-canonical." >&2
+    echo "    Either move it aside or pass --canonical-path, or use --no-canonical." >&2
     exit 1
   fi
 
@@ -474,7 +634,7 @@ if [[ "$USE_CANONICAL" -eq 1 ]]; then
   fi
 else
   echo "→ Canonical handle"
-  echo "  · skipped (--no-canonical); rc will reference $REPO_ROOT directly"
+  echo "  · skipped (--no-canonical); shim will reference $REPO_ROOT directly"
 fi
 
 # ---- Auth ---------------------------------------------------------------
@@ -499,50 +659,101 @@ else
   fi
 fi
 
-# ---- Warn about unmanaged duplicates -----------------------------------
+# ---- Install shim -------------------------------------------------------
 
-if [[ -f "$RC_FILE" ]] && grep -Eq "^[[:space:]]*${NAME}[[:space:]]*\(\)|^[[:space:]]*alias[[:space:]]+${NAME}=" "$RC_FILE"; then
-  if ! grep -qF "$MARKER_BEGIN" "$RC_FILE"; then
-    echo "  ! detected an existing unmanaged definition of '${NAME}' in $RC_FILE" >&2
-    echo "    The new managed block will be appended; the later definition wins, but you may want to remove the old one by hand." >&2
-  fi
+echo "→ Shim"
+mkdir -p "$BIN_DIR"
+
+# Refuse to clobber a non-managed file at the shim path.
+if [[ -e "$SHIM_FILE" && ! -f "$SHIM_FILE" ]]; then
+  echo "  ! $SHIM_FILE exists and is not a regular file — refusing to overwrite." >&2
+  exit 1
+fi
+if [[ -f "$SHIM_FILE" ]] && ! grep -q "^# ${NAME} — auto-generated by glooai/opencode install.sh" "$SHIM_FILE" 2>/dev/null; then
+  echo "  ! $SHIM_FILE exists and is not a managed ${NAME} shim — refusing to overwrite." >&2
+  echo "    Move it aside or pass --bin-dir <path> with a different location." >&2
+  exit 1
 fi
 
-# ---- Write the rc -------------------------------------------------------
+# Atomic write: temp file, chmod, rename.
+SHIM_TMP="$(mktemp "${SHIM_FILE}.XXXXXX")"
+render_shim > "$SHIM_TMP"
+chmod 755 "$SHIM_TMP"
+mv "$SHIM_TMP" "$SHIM_FILE"
+echo "  ✓ wrote shim to $SHIM_FILE (mode 0755)"
+
+# Sanity: bash should be able to parse the shim.
+if bash -n "$SHIM_FILE" 2>/dev/null; then
+  echo "  ✓ shim syntax OK"
+else
+  echo "  ! shim syntax check failed; please review $SHIM_FILE" >&2
+fi
+
+# ---- Shell integration --------------------------------------------------
 
 echo "→ Shell integration"
-mkdir -p "$(dirname "$RC_FILE")"
-[[ -f "$RC_FILE" ]] || touch "$RC_FILE"
 
-strip_managed_block "$RC_FILE"
+if [[ "$SHELL_KIND" == "unknown" ]]; then
+  cat <<UNSUPPORTED
+  ! Detected shell: $(basename "${SHELL:-unknown}")
+    No managed rc block written. Add the bin dir to PATH manually in your
+    shell's startup file:
 
-{
-  if [[ -s "$RC_FILE" ]] && [[ -n "$(tail -c1 "$RC_FILE" 2>/dev/null || true)" ]]; then
+      $BIN_DIR
+
+    Then run: ${NAME}
+
+    (Or pass --rc <path> to write the bash/zsh-style PATH snippet to a
+     file you do source.)
+UNSUPPORTED
+else
+  mkdir -p "$(dirname "$RC_FILE")"
+  [[ -f "$RC_FILE" ]] || touch "$RC_FILE"
+
+  strip_managed_block "$RC_FILE"
+
+  {
+    if [[ -s "$RC_FILE" ]] && [[ -n "$(tail -c1 "$RC_FILE" 2>/dev/null || true)" ]]; then
+      printf '\n'
+    fi
     printf '\n'
-  fi
-  printf '\n'
-  printf '%s\n' "$BLOCK"
-} >> "$RC_FILE"
+    render_rc_block "$SHELL_KIND" "$BIN_DIR"
+  } >> "$RC_FILE"
 
-echo "  ✓ wrote managed ${NAME} block to $RC_FILE"
+  echo "  ✓ wrote managed PATH block to $RC_FILE ($SHELL_KIND)"
 
-case "$(basename "${SHELL:-bash}")" in
-  zsh)  zsh -n "$RC_FILE" 2>/dev/null && echo "  ✓ rc syntax OK" || echo "  ! syntax check failed; please review $RC_FILE" >&2 ;;
-  bash) bash -n "$RC_FILE" 2>/dev/null && echo "  ✓ rc syntax OK" || echo "  ! syntax check failed; please review $RC_FILE" >&2 ;;
-  *)    : ;;
+  case "$SHELL_KIND" in
+    zsh)  zsh -n "$RC_FILE" 2>/dev/null && echo "  ✓ rc syntax OK" || echo "  ! syntax check failed; please review $RC_FILE" >&2 ;;
+    bash) bash -n "$RC_FILE" 2>/dev/null && echo "  ✓ rc syntax OK" || echo "  ! syntax check failed; please review $RC_FILE" >&2 ;;
+    fish) command -v fish >/dev/null 2>&1 && fish -n "$RC_FILE" 2>/dev/null && echo "  ✓ rc syntax OK" \
+            || echo "  · skipped fish syntax check (no fish on PATH)" ;;
+  esac
+fi
+
+# Inform the user about PATH state in *this* shell.
+case ":$PATH:" in
+  *":$BIN_DIR:"*)
+    echo "  ✓ $BIN_DIR is already on PATH in this shell"
+    ;;
+  *)
+    echo "  ! $BIN_DIR is not yet on PATH in this shell — open a new terminal or \`source\` your rc"
+    ;;
 esac
 
 cat <<DONE
 
 Done. To use ${NAME} now in this shell:
 
-  source $RC_FILE
+  source $RC_FILE      # zsh/bash; for fish: \`source ${RC_FILE}\` or new shell
   ${NAME}
 
 Or open a new terminal. From any directory, just run \`${NAME}\` to launch the
 OpenCode TUI with your project's cwd as the workspace and the Gloo AI provider
 available in the model picker.
 
-To rotate credentials later: $REPO_ROOT/install.sh --auth
-To remove:                   $REPO_ROOT/install.sh --uninstall
+Local-dev mode (against a local TangoGroup/ai-api stack):
+  GLOOCODE_LOCAL=1 ${NAME}      # opt-in, sources <repo>/.env.local
+
+To rotate credentials:  $REPO_ROOT/install.sh --auth
+To remove:              $REPO_ROOT/install.sh --uninstall
 DONE
