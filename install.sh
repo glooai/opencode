@@ -712,6 +712,19 @@ else
 
   strip_managed_block "$RC_FILE"
 
+  # After strip, any remaining ${NAME} function or alias is unmanaged by
+  # construction. In zsh/bash, shell functions take precedence over PATH-
+  # resolved binaries, so an unmanaged function will *shadow* the shim
+  # silently. Detect and warn loudly.
+  if [[ "$SHELL_KIND" == "zsh" || "$SHELL_KIND" == "bash" ]]; then
+    if grep -Eq "^[[:space:]]*${NAME}[[:space:]]*\(\)|^[[:space:]]*function[[:space:]]+${NAME}[[:space:]]*\(?\)?[[:space:]]*\{|^[[:space:]]*alias[[:space:]]+${NAME}=" "$RC_FILE"; then
+      echo "  ! Detected an unmanaged '${NAME}' function or alias in $RC_FILE." >&2
+      echo "    Shell functions take precedence over PATH-resolved binaries, so this" >&2
+      echo "    will SHADOW the new shim at ${SHIM_FILE} when you type \`${NAME}\`." >&2
+      echo "    Remove the function/alias by hand to let the shim take over." >&2
+    fi
+  fi
+
   {
     if [[ -s "$RC_FILE" ]] && [[ -n "$(tail -c1 "$RC_FILE" 2>/dev/null || true)" ]]; then
       printf '\n'
